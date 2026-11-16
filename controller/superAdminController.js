@@ -3,6 +3,32 @@ const Teacher = require("../models/Teacher");
 const Course = require("../models/Course");
 const Order = require("../models/Order");
 const Admin = require("../models/Admin");
+const bcrypt = require("bcryptjs");
+const { buildBuckets } = require("../utils/analyticsBuckets");
+
+// Revenue split on every completed order. Teacher share is the remainder so
+// the two always add up to the total.
+const PLATFORM_SHARE = 0.3;
+function splitRevenue(total) {
+  const platformRevenue = Math.round(total * PLATFORM_SHARE);
+  return { platformRevenue, teacherRevenue: total - platformRevenue };
+}
+
+// Completed-order revenue and order count per course id
+async function revenueByCourse() {
+  const rows = await Order.aggregate([
+    { $match: { status: "completed" } },
+    { $group: { _id: "$courseId", revenue: { $sum: "$amount" }, orders: { $sum: 1 } } },
+  ]);
+  return new Map(rows.map((r) => [r._id.toString(), r]));
+}
+
+function averageRating(ratings) {
+  const valid = (ratings || []).filter((r) => typeof r.rating === "number");
+  if (valid.length === 0) return { rating: null, reviewCount: 0 };
+  const avg = valid.reduce((sum, r) => sum + r.rating, 0) / valid.length;
+  return { rating: Math.round(avg * 10) / 10, reviewCount: valid.length };
+}
 
 /**
  * SuperAdmin Overview Stats
@@ -18,9 +44,12 @@ async function getOverview(req, res) {
     const deletedTeachers = await Teacher.countDocuments({ isDeleted: true });
     const deletedCourses = await Course.countDocuments({ isDeleted: true });
 
-    const orders = await Order.find({ status: "completed" });
+    const orders = await Order.find({ status: "completed" }).select("amount");
     const totalRevenue = orders.reduce((sum, order) => sum + (order.amount || 0), 0);
     const totalOrdersCount = await Order.countDocuments();
+    const pendingOrders = await Order.countDocuments({ status: "pending" });
+    const failedOrders = await Order.countDocuments({ status: "failed" });
+    const { platformRevenue, teacherRevenue } = splitRevenue(totalRevenue);
 
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
@@ -45,12 +74,12 @@ async function getOverview(req, res) {
         },
         revenue: {
           total: totalRevenue,
-          platformRevenue: Math.round(totalRevenue * 0.3),
-          teacherRevenue: Math.round(totalRevenue * 0.7),
+          platformRevenue,
+          teacherRevenue,
           totalOrders: totalOrdersCount,
           completedOrders: orders.length,
-          pendingOrders: 0,
-          failedOrders: 0,
+          pendingOrders,
+          failedOrders,
         },
         recentActivity: {
           newStudents,
@@ -73,29 +102,23 @@ async function getRevenueAnalytics(req, res) {
   try {
     const orders = await Order.find({ status: "completed" }).populate("courseId");
     const totalRevenue = orders.reduce((sum, order) => sum + (order.amount || 0), 0);
-    const platformRevenue = Math.round(totalRevenue * 0.3);
-    const teacherRevenue = Math.round(totalRevenue * 0.7);
 
-    const catRevenueMap = {};
+    const catTotals = {};
     orders.forEach((o) => {
       const cat = o.courseId?.category || "General";
-      if (!catRevenueMap[cat]) {
-        catRevenueMap[cat] = { _id: cat, totalRevenue: 0, platformRevenue: 0, teacherRevenue: 0 };
-      }
-      const amt = o.amount || 0;
-      catRevenueMap[cat].totalRevenue += amt;
-      catRevenueMap[cat].platformRevenue += Math.round(amt * 0.3);
-      catRevenueMap[cat].teacherRevenue += Math.round(amt * 0.7);
+      catTotals[cat] = (catTotals[cat] || 0) + (o.amount || 0);
     });
-
-    const revenueByCategory = Object.values(catRevenueMap);
+    const revenueByCategory = Object.entries(catTotals).map(([cat, total]) => ({
+      _id: cat,
+      totalRevenue: total,
+      ...splitRevenue(total),
+    }));
 
     res.json({
       success: true,
       data: {
         totalRevenue,
-        platformRevenue,
-        teacherRevenue,
+        ...splitRevenue(totalRevenue),
         revenueByCategory,
         orders,
       },
@@ -112,21 +135,34 @@ async function getRevenueAnalytics(req, res) {
  */
 async function getUserGrowth(req, res) {
   try {
-    const period = parseInt(req.query.period) || 30;
-    const students = await Student.find({ isDeleted: { $ne: true } }).select("_id name");
-    
-    const studentGrowth = [
-      { _id: "Week 1", count: Math.max(1, Math.floor(students.length * 0.2)) },
-      { _id: "Week 2", count: Math.max(1, Math.floor(students.length * 0.4)) },
-      { _id: "Week 3", count: Math.max(1, Math.floor(students.length * 0.7)) },
-      { _id: "Week 4", count: students.length },
-    ];
+    const range = buildBuckets(req.query.period);
+    // Student has no createdAt field; the ObjectId carries the creation time.
+    const students = await Student.find({ isDeleted: { $ne: true } }).select("_id").lean();
+
+    const newPerBucket = new Array(range.buckets.length).fill(0);
+    let before = 0;
+    students.forEach((s) => {
+      const createdAt = s._id.getTimestamp();
+      if (createdAt < range.start) {
+        before += 1;
+        return;
+      }
+      const i = range.indexOf(createdAt);
+      if (i >= 0) newPerBucket[i] += 1;
+    });
+
+    let running = before;
+    const studentGrowth = range.buckets.map((b, i) => {
+      running += newPerBucket[i];
+      return { _id: b.label, date: b.start, newStudents: newPerBucket[i], count: running };
+    });
 
     res.json({
       success: true,
       data: {
         studentGrowth,
-        period,
+        period: range.period,
+        unit: range.unit,
       },
     });
   } catch (error) {
@@ -141,33 +177,35 @@ async function getUserGrowth(req, res) {
  */
 async function getTeacherPerformance(req, res) {
   try {
-    const teachers = await Teacher.find({ isDeleted: { $ne: true } })
-      .select("-password")
-      .populate("courses");
+    const [teachers, revenueMap] = await Promise.all([
+      Teacher.find({ isDeleted: { $ne: true } }).select("-password").populate("courses"),
+      revenueByCourse(),
+    ]);
 
-    const teacherPerformance = teachers.map((t) => {
-      const courses = t.courses || [];
-      const totalCourses = courses.length;
-      let totalStudents = 0;
-      let totalRevenue = 0;
+    const teacherPerformance = teachers
+      .map((t) => {
+        const courses = (t.courses || []).filter((c) => c && !c.isDeleted);
+        const totalCourses = courses.length;
+        let totalStudents = 0;
+        let totalRevenue = 0;
 
-      courses.forEach((c) => {
-        const studentCount = c.students ? c.students.length : 0;
-        totalStudents += studentCount;
-        totalRevenue += (c.price || 0) * studentCount;
-      });
+        courses.forEach((c) => {
+          totalStudents += c.students ? c.students.length : 0;
+          totalRevenue += revenueMap.get(c._id.toString())?.revenue || 0;
+        });
 
-      return {
-        teacherId: t._id,
-        name: t.name,
-        email: t.email,
-        totalCourses,
-        totalStudents,
-        totalRevenue,
-        averageRevenuePerCourse: totalCourses ? totalRevenue / totalCourses : 0,
-        verificationStatus: t.verificationStatus || "Pending",
-      };
-    });
+        return {
+          teacherId: t._id,
+          name: t.name,
+          email: t.email,
+          totalCourses,
+          totalStudents,
+          totalRevenue,
+          averageRevenuePerCourse: totalCourses ? Math.round(totalRevenue / totalCourses) : 0,
+          verificationStatus: t.verificationStatus || "NotSubmitted",
+        };
+      })
+      .sort((a, b) => b.totalRevenue - a.totalRevenue);
 
     res.json({
       success: true,
@@ -185,17 +223,18 @@ async function getTeacherPerformance(req, res) {
  */
 async function getCoursePerformance(req, res) {
   try {
-    const courses = await Course.find({ isDeleted: { $ne: true } })
-      .populate("teacher", "name email")
-      .populate("students", "name email");
+    const [courses, revenueMap] = await Promise.all([
+      Course.find({ isDeleted: { $ne: true } })
+        .populate("teacher", "name email")
+        .populate("students", "name email"),
+      revenueByCourse(),
+    ]);
 
     const coursePerformance = courses.map((c) => {
       const enrolledStudents = c.students ? c.students.length : 0;
-      const totalRevenue = (c.price || 0) * enrolledStudents;
-      const ratings = c.ratings || [];
-      const avgRating = ratings.length
-        ? ratings.reduce((sum, r) => sum + (r.rating || 0), 0) / ratings.length
-        : 4.8;
+      const sales = revenueMap.get(c._id.toString());
+      // rating is null when nobody has rated the course yet
+      const { rating, reviewCount } = averageRating(c.ratings);
 
       return {
         courseId: c._id,
@@ -205,9 +244,10 @@ async function getCoursePerformance(req, res) {
         price: c.price || 0,
         teacher: c.teacher,
         enrolledStudents,
-        totalRevenue,
-        rating: avgRating,
-        reviewCount: ratings.length,
+        totalRevenue: sales?.revenue || 0,
+        orders: sales?.orders || 0,
+        rating,
+        reviewCount,
       };
     });
 
@@ -227,42 +267,92 @@ async function getCoursePerformance(req, res) {
  */
 async function getEnrollmentTrends(req, res) {
   try {
-    const courses = await Course.find({ isDeleted: { $ne: true } });
-    
+    const range = buildBuckets(req.query.period);
+
+    const [courses, students, orders] = await Promise.all([
+      Course.find({ isDeleted: { $ne: true } }).select("category students").lean(),
+      Student.find({ "enrolledCourses.enrolledAt": { $gte: range.start } })
+        .select("enrolledCourses.enrolledAt")
+        .lean(),
+      Order.find({ status: "completed", createdAt: { $gte: range.start } })
+        .select("amount createdAt")
+        .lean(),
+    ]);
+
+    // All-time enrollments per category (current students of each course)
     const catMap = {};
-    let totalEnrollments = 0;
     courses.forEach((c) => {
       const cat = c.category || "General";
-      const count = c.students ? c.students.length : 0;
-      catMap[cat] = (catMap[cat] || 0) + count;
-      totalEnrollments += count;
+      catMap[cat] = (catMap[cat] || 0) + (c.students ? c.students.length : 0);
     });
-
     const categoryEnrollments = Object.keys(catMap).map((cat) => ({
       _id: cat,
       enrollments: catMap[cat],
     }));
 
-    const dailyTrends = [
-      { _id: "Mon", enrollments: Math.max(1, Math.floor(totalEnrollments * 0.1)), revenue: 1500 },
-      { _id: "Tue", enrollments: Math.max(1, Math.floor(totalEnrollments * 0.2)), revenue: 3000 },
-      { _id: "Wed", enrollments: Math.max(1, Math.floor(totalEnrollments * 0.4)), revenue: 4500 },
-      { _id: "Thu", enrollments: Math.max(1, Math.floor(totalEnrollments * 0.6)), revenue: 6000 },
-      { _id: "Fri", enrollments: Math.max(1, Math.floor(totalEnrollments * 0.8)), revenue: 8000 },
-      { _id: "Sat", enrollments: Math.max(1, Math.floor(totalEnrollments * 0.9)), revenue: 9500 },
-      { _id: "Sun", enrollments: totalEnrollments, revenue: 11000 },
-    ];
+    // Enrollments and revenue inside the selected period
+    const dailyTrends = range.buckets.map((b) => ({ _id: b.label, date: b.start, enrollments: 0, revenue: 0 }));
+    students.forEach((s) => {
+      (s.enrolledCourses || []).forEach((e) => {
+        const i = e.enrolledAt ? range.indexOf(e.enrolledAt) : -1;
+        if (i >= 0) dailyTrends[i].enrollments += 1;
+      });
+    });
+    orders.forEach((o) => {
+      const i = range.indexOf(o.createdAt);
+      if (i >= 0) dailyTrends[i].revenue += o.amount || 0;
+    });
 
     res.json({
       success: true,
       data: {
         dailyTrends,
         categoryEnrollments,
+        period: range.period,
+        unit: range.unit,
       },
     });
   } catch (error) {
     console.error("Error in getEnrollmentTrends:", error);
     res.status(500).json({ success: false, message: "Server error fetching enrollment trends" });
+  }
+}
+
+/**
+ * Create an Admin account. Admins cannot self-register.
+ * @route POST /superadmin/admins
+ */
+async function createAdmin(req, res) {
+  try {
+    const { name, email, password } = req.body || {};
+    if (typeof name !== "string" || typeof email !== "string" || typeof password !== "string" || !name.trim() || !email.trim()) {
+      return res.status(400).json({ success: false, message: "Name, email and password are required" });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ success: false, message: "Password must be at least 8 characters" });
+    }
+
+    const taken =
+      (await Admin.exists({ email })) || (await Teacher.exists({ email })) || (await Student.exists({ email }));
+    if (taken) {
+      return res.status(409).json({ success: false, message: "User already exists with this email" });
+    }
+
+    const admin = await Admin.create({
+      name: name.trim(),
+      email: email.trim(),
+      password: await bcrypt.hash(password, 10),
+      role: "Admin",
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Admin created successfully",
+      data: { id: admin._id, name: admin.name, email: admin.email, role: admin.role },
+    });
+  } catch (error) {
+    console.error("Error in createAdmin:", error);
+    res.status(500).json({ success: false, message: "Server error creating admin" });
   }
 }
 
@@ -446,6 +536,7 @@ async function restoreCourse(req, res) {
 }
 
 module.exports = {
+  createAdmin,
   getOverview,
   getRevenueAnalytics,
   getUserGrowth,

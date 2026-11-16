@@ -1,10 +1,12 @@
 const jwt = require("jsonwebtoken");
 const Admin = require("../models/Admin");
+const { JWT_SECRET, RESET_TOKEN_PURPOSE } = require("../config/jwt");
+const { getModelForRole } = require("../utils/userModels");
 
-const JWT_SECRET = process.env.JWT_SECRET || "aryan123";
-
-// Middleware to verify any logged-in user (Student / Teacher / Admin)
-function verify(req, res, next) {
+// Middleware to verify any logged-in user (Student / Teacher / Admin / SuperAdmin).
+// Besides checking the signature and expiry, it loads the user so that a
+// soft-deleted account loses access immediately, not only at its next login.
+async function verify(req, res, next) {
   try {
     let token;
 
@@ -24,13 +26,32 @@ function verify(req, res, next) {
       return res.status(401).json({ message: "Access denied, no token provided", success: false, error: true });
     }
 
-    // Extract and verify token
-    const payload = jwt.verify(token, JWT_SECRET);
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch (error) {
+      return res.status(401).json({ message: "Invalid or expired token", success: false, error: true });
+    }
+
+    // A password-reset token is signed with the same secret but is not a login token.
+    if (payload.purpose === RESET_TOKEN_PURPOSE) {
+      return res.status(401).json({ message: "Invalid or expired token", success: false, error: true });
+    }
+
+    const Model = getModelForRole(payload.role);
+    const user = Model ? await Model.findById(payload._id).select("role isDeleted").lean() : null;
+    if (!user || user.role !== payload.role) {
+      return res.status(401).json({ message: "Invalid or expired token", success: false, error: true });
+    }
+    if (user.isDeleted) {
+      return res.status(401).json({ message: "This account has been deactivated", success: false, error: true });
+    }
+
     req.user = payload;
     next();
   } catch (error) {
     console.error("Error in verify middleware:", error.message);
-    return res.status(403).json({ message: "Invalid or expired token", success: false, error: true });
+    return res.status(500).json({ message: "Server error during authentication", success: false, error: true });
   }
 }
 

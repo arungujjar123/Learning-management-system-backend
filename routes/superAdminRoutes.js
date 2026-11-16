@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { verify, verifySuperAdmin } = require("../middleware/verify");
 const {
+  createAdmin,
   getOverview,
   getRevenueAnalytics,
   getUserGrowth,
@@ -29,6 +30,7 @@ router.get("/analytics/course-performance", getCoursePerformance);
 router.get("/analytics/enrollment-trends", getEnrollmentTrends);
 
 // User Management & Restore
+router.post("/admins", createAdmin);
 router.get("/users", getAllUsers);
 router.get("/users/deleted", getDeletedUsers);
 router.put("/users/:userId/restore", restoreUser);

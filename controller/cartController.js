@@ -1,6 +1,7 @@
 const Cart = require("../models/Cart");
 const Course = require("../models/Course");
 const Student = require("../models/Student");
+const { enrollStudentInCourses, EnrollmentError } = require("../services/enrollment");
 
 // Get cart contents
 async function getCart(req, res) {
@@ -182,49 +183,8 @@ async function updateEnrollCourses(req, res) {
   }
 
   try {
-    const uniqueCourseIds = [...new Set(courseIds.map((id) => id?.toString()))].filter(Boolean);
-
-    if (uniqueCourseIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: true,
-        message: "Invalid course identifiers provided",
-      });
-    }
-
-    const enrollementObjects = uniqueCourseIds.map(id => ({
-      course : id,
-      enrolledAt: new Date(),
-      avgQuizScore: 0,
-      completedQuizzes: 0,
-      progress: 0
-    }));
-
-
-    await Student.findByIdAndUpdate(
-      studentId,
-      {
-        // $addToSet: {
-        //   enrolledCourses: {
-        //     $each: uniqueCourseIds,
-        //   },
-        // },
-
-        $push: {
-          enrolledCourses: {
-            $each: enrollementObjects,
-          },
-        },
-      },
-      { new: true }
-    );
-
-    await Course.updateMany(
-      { _id: { $in: uniqueCourseIds } },
-      {
-        $addToSet: { students: studentId },
-      }
-    );
+    // Records one completed Order per newly enrolled course (used by revenue analytics)
+    await enrollStudentInCourses(studentId, courseIds);
 
     const updatedStudent = await Student.findById(studentId)
       .select("name email enrolledCourses")
@@ -257,6 +217,9 @@ async function updateEnrollCourses(req, res) {
       },
     });
   } catch (error) {
+    if (error instanceof EnrollmentError) {
+      return res.status(error.status).json({ success: false, error: true, message: error.message });
+    }
     console.log("err occured...", error);
     res.status(500).json({
       message: error?.message || "Could not complete enrollment",

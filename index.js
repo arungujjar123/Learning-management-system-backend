@@ -60,36 +60,37 @@ if (!MONGO_URL) {
   process.exit(1);
 }
 
+// Creates the first SuperAdmin from environment variables, so no default
+// password lives in the source code. Additional Admins are created by the
+// SuperAdmin through POST /superadmin/admins.
 const seedInitialAdmins = async () => {
   try {
     const bcrypt = require("bcryptjs");
     const Admin = require("./models/Admin");
 
-    // Seed SuperAdmin if not exists
     const existingSuperAdmin = await Admin.findOne({ role: "SuperAdmin" });
-    if (!existingSuperAdmin) {
-      const hashedPassword = await bcrypt.hash("superadmin123", 10);
-      await Admin.create({
-        name: "Platform Owner (SuperAdmin)",
-        email: "superadmin@lms.com",
-        password: hashedPassword,
-        role: "SuperAdmin",
-      });
-      console.log("✅ SuperAdmin seeded: superadmin@lms.com / superadmin123");
+    if (existingSuperAdmin) return;
+
+    const email = process.env.SUPERADMIN_EMAIL;
+    const password = process.env.SUPERADMIN_PASSWORD;
+    if (!email || !password) {
+      console.warn(
+        "⚠️  No SuperAdmin exists. Set SUPERADMIN_EMAIL and SUPERADMIN_PASSWORD in .env to create one."
+      );
+      return;
+    }
+    if (password.length < 12) {
+      console.warn("⚠️  SUPERADMIN_PASSWORD must be at least 12 characters. SuperAdmin not created.");
+      return;
     }
 
-    // Seed Admin if not exists
-    const existingAdmin = await Admin.findOne({ email: "admin@lms.com" });
-    if (!existingAdmin) {
-      const hashedPassword = await bcrypt.hash("admin123", 10);
-      await Admin.create({
-        name: "Platform Manager (Admin)",
-        email: "admin@lms.com",
-        password: hashedPassword,
-        role: "Admin",
-      });
-      console.log("✅ Admin seeded: admin@lms.com / admin123");
-    }
+    await Admin.create({
+      name: process.env.SUPERADMIN_NAME || "Platform Owner (SuperAdmin)",
+      email,
+      password: await bcrypt.hash(password, 10),
+      role: "SuperAdmin",
+    });
+    console.log(`✅ SuperAdmin created: ${email}`);
   } catch (err) {
     console.error("Error seeding admin accounts:", err);
   }

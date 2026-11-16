@@ -1,6 +1,7 @@
 const Student = require("../models/Student");
 const QuizSubmission = require("../models/QuizSubmission");
 const Course = require("../models/Course");
+const { enrollStudentInCourses, EnrollmentError } = require("../services/enrollment");
 
 async function getStudents(req, res) {
   try {
@@ -90,33 +91,15 @@ async function studentProfile(req, res) {
 }
 
 async function updateEnrollCourses(req, res) {
-  console.log(req.body);
-  const { courseIds } = req.body;
-  console.log(courseIds);
+  const { courseIds } = req.body || {};
   const studentId = req.user._id;
   try {
-    // Convert courseIds to the new format
-    const enrolledCoursesData = courseIds.map((courseId) => ({
-      course: courseId,
-      enrolledAt: new Date(),
-      quizScores: [],
-    }));
-
-    const student = await Student.findById(studentId);
-    
-    // Get existing course IDs to avoid duplicates
-    const existingCourseIds = student.enrolledCourses.map(
-      (ec) => ec.course.toString()
-    );
-
-    // Filter out already enrolled courses
-    const newCourses = enrolledCoursesData.filter(
-      (ec) => !existingCourseIds.includes(ec.course.toString())
-    );
-
-    // Add new courses
-    student.enrolledCourses.push(...newCourses);
-    await student.save();
+    if (!Array.isArray(courseIds) || courseIds.length === 0) {
+      throw new EnrollmentError(400, "No courses supplied for enrollment");
+    }
+    // Same path as checkout, so every enrollment has an Order behind it
+    await enrollStudentInCourses(studentId, courseIds);
+    const student = await Student.findById(studentId).select("-password");
 
     res.json({
       message: "Student courses updated successfully",
@@ -125,9 +108,9 @@ async function updateEnrollCourses(req, res) {
       error: false,
     });
   } catch (error) {
-    console.log("err occured...", error);
-    res.json({
-      message: error?.message || error,
+    if (!(error instanceof EnrollmentError)) console.log("err occured...", error);
+    res.status(error instanceof EnrollmentError ? error.status : 500).json({
+      message: error instanceof EnrollmentError ? error.message : "Could not update enrolled courses",
       success: false,
       error: true,
     });
@@ -214,7 +197,7 @@ async function enrollInCourse(req, res) {
     const { courseId } = req.params;
     const studentId = req.user._id; // from JWT token
 
-    const course = await Course.findById(courseId);
+    const course = await Course.findOne({ _id: courseId, isDeleted: { $ne: true } }).select("_id");
     if (!course) {
       return res.status(404).json({
         message: "Course not found",
@@ -223,8 +206,9 @@ async function enrollInCourse(req, res) {
       });
     }
 
-    // Check if student is already enrolled
-    if (course.students.includes(studentId)) {
+    // Same path as checkout, so every enrollment has an Order behind it
+    const { enrolledCourseIds } = await enrollStudentInCourses(studentId, [courseId]);
+    if (enrolledCourseIds.length === 0) {
       return res.json({
         message: "You are already enrolled in this course",
         success: false,
@@ -232,16 +216,15 @@ async function enrollInCourse(req, res) {
       });
     }
 
-    // Add student to course
-    course.students.push(studentId);
-    await course.save();
-
     res.json({
       message: "Successfully enrolled in course",
       success: true,
       error: false,
     });
   } catch (error) {
+    if (error instanceof EnrollmentError) {
+      return res.status(error.status).json({ message: error.message, success: false, error: true });
+    }
     console.error("Error enrolling in course:", error);
     res.status(500).json({
       message: "Error enrolling in course",

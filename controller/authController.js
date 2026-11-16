@@ -3,11 +3,16 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const Student = require("../models/Student");
 const Teacher = require("../models/Teacher");
-const Admin = require("../models/Admin");
 const Otp = require("../models/Otp");
 const { sendOtpEmail } = require("../utils/sendEmail");
+const { JWT_SECRET, JWT_EXPIRES_IN, RESET_TOKEN_PURPOSE } = require("../config/jwt");
+const { getModelForRole, findUserByEmail } = require("../utils/userModels");
 
-// 🔹 Register User (Student / Teacher / Admin)
+// Only these roles can sign themselves up. Admins are created by a SuperAdmin
+// (POST /superadmin/admins) and the SuperAdmin is seeded from the environment.
+const SELF_REGISTER_ROLES = ["Student", "Teacher"];
+
+// 🔹 Register User (Student / Teacher)
 async function register(req, res) {
   try {
     const { name, email, password, role } = req.body;
@@ -20,11 +25,16 @@ async function register(req, res) {
       });
     }
 
+    if (!SELF_REGISTER_ROLES.includes(role)) {
+      return res.status(403).json({
+        message: "You can only register as a Student or Teacher",
+        success: false,
+        error: true,
+      });
+    }
+
     // ✅ Check if user already exists
-    let existingUser =
-      (await Student.findOne({ email })) ||
-      (await Teacher.findOne({ email })) ||
-      (await Admin.findOne({ email }));
+    const existingUser = await findUserByEmail(email);
 
     if (existingUser) {
       return res.json({
@@ -37,28 +47,17 @@ async function register(req, res) {
     // ✅ Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    let newUser;
-    if (role === "Student") {
-      newUser = new Student({ name, email, password: hashedPassword, role });
-    } else if (role === "Teacher") {
-      newUser = new Teacher({ name, email, password: hashedPassword, role });
-    } else if (role === "Admin") {
-      newUser = new Admin({ name, email, password: hashedPassword, role });
-    } else if (role === "SuperAdmin") {
-      newUser = new Admin({ name, email, password: hashedPassword, role: "SuperAdmin" });
-    } else {
-      return res.json({
-        message: "Invalid role provided",
-        success: false,
-        error: true,
-      });
-    }
-
-    const savedUser = await newUser.save();
+    const Model = role === "Student" ? Student : Teacher;
+    const savedUser = await new Model({ name, email, password: hashedPassword, role }).save();
 
     res.json({
       message: `${role} registered successfully`,
-      data: savedUser,
+      data: {
+        id: savedUser._id,
+        name: savedUser.name,
+        email: savedUser.email,
+        role: savedUser.role,
+      },
       success: true,
       error: false,
     });
@@ -66,19 +65,9 @@ async function register(req, res) {
     console.error("Registration error:", error);
     res.status(500).json({
       message: "Server error during registration",
+      success: false,
+      error: true,
     });
-
-    const admin = await Admin.findOne({ email });
-    const student = await Student.findOne({ email });
-    const teacher = await Teacher.findOne({ email });
-
-    if (!admin && !student && !teacher) {
-      res.json({
-        message: "User does not exist.",
-        success: false,
-        error: true,
-      });
-    }
   }
 }
 
@@ -96,10 +85,7 @@ async function login(req, res) {
     }
 
     // ✅ Try finding user in all roles
-    let user =
-      (await Admin.findOne({ email })) ||
-      (await Teacher.findOne({ email })) ||
-      (await Student.findOne({ email }));
+    const user = await findUserByEmail(email);
 
     if (!user) {
       return res.json({
@@ -119,6 +105,16 @@ async function login(req, res) {
       });
     }
 
+    // Soft-deleted accounts cannot sign in. Checked after the password so the
+    // message only reaches the account owner.
+    if (user.isDeleted) {
+      return res.status(403).json({
+        message: "This account has been deactivated. Please contact an administrator.",
+        success: false,
+        error: true,
+      });
+    }
+
     //  Generate token
     const token = jwt.sign(
       {
@@ -126,7 +122,8 @@ async function login(req, res) {
         role: user.role,
         email: user.email,
       },
-      "aryan123"
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
     );
 
     // Inside login function, before sending response...
@@ -192,22 +189,15 @@ async function login(req, res) {
 
 /**
  * Get Profile - Retrieves the current user's profile data
- * Works for all roles (Student, Teacher, Admin) using JWT payload
+ * Works for all roles (Student, Teacher, Admin, SuperAdmin) using JWT payload
  * @route GET /auth/profile
  */
 async function getProfile(req, res) {
   try {
     const { _id, role } = req.user;
 
-    // Select the appropriate model based on user role
-    let user = null;
-    if (role === "Student") {
-      user = await Student.findById(_id).select("-password");
-    } else if (role === "Teacher") {
-      user = await Teacher.findById(_id).select("-password");
-    } else if (role === "Admin") {
-      user = await Admin.findById(_id).select("-password");
-    }
+    const Model = getModelForRole(role);
+    const user = Model ? await Model.findById(_id).select("-password") : null;
 
     if (!user) {
       return res.status(404).json({
@@ -257,15 +247,8 @@ async function updateProfile(req, res) {
       });
     }
 
-    // Select the appropriate model based on user role
-    let Model;
-    if (role === "Student") {
-      Model = Student;
-    } else if (role === "Teacher") {
-      Model = Teacher;
-    } else if (role === "Admin") {
-      Model = Admin;
-    } else {
+    const Model = getModelForRole(role);
+    if (!Model) {
       return res.status(400).json({
         message: "Invalid role",
         success: false,
@@ -346,15 +329,8 @@ async function changePassword(req, res) {
       });
     }
 
-    // Select the appropriate model based on user role
-    let user = null;
-    if (role === "Student") {
-      user = await Student.findById(_id);
-    } else if (role === "Teacher") {
-      user = await Teacher.findById(_id);
-    } else if (role === "Admin") {
-      user = await Admin.findById(_id);
-    }
+    const Model = getModelForRole(role);
+    const user = Model ? await Model.findById(_id) : null;
 
     if (!user) {
       return res.status(404).json({
@@ -407,23 +383,6 @@ async function changePassword(req, res) {
 // ============================================
 // 🔹 FORGOT PASSWORD FUNCTIONS
 // ============================================
-
-const JWT_SECRET = process.env.JWT_SECRET || "aryan123";
-
-async function findUserByEmail(email) {
-  return (
-    (await Student.findOne({ email })) ||
-    (await Teacher.findOne({ email })) ||
-    (await Admin.findOne({ email }))
-  );
-}
-
-function getModelForRole(role) {
-  if (role === "Student") return Student;
-  if (role === "Teacher") return Teacher;
-  if (role === "Admin") return Admin;
-  return null;
-}
 
 async function forgotPassword(req, res) {
   try {
@@ -501,7 +460,7 @@ async function verifyOtp(req, res) {
 
     // Generate a short-lived reset token (5 minutes)
     const resetToken = jwt.sign(
-      { email, purpose: "password-reset" },
+      { email, purpose: RESET_TOKEN_PURPOSE },
       JWT_SECRET,
       { expiresIn: "5m" }
     );
@@ -557,7 +516,7 @@ async function resetPassword(req, res) {
       });
     }
 
-    if (decoded.email !== email || decoded.purpose !== "password-reset") {
+    if (decoded.email !== email || decoded.purpose !== RESET_TOKEN_PURPOSE) {
       return res.status(400).json({
         message: "Invalid reset token",
         success: false,
