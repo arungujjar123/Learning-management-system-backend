@@ -1,13 +1,14 @@
 const express = require("express");
 const router = express.Router();
 const teacherController = require("../controller/teacherController");
-const { verify, verifyTeacher, upload } = require("../middleware");
+const { verify, verifyTeacher, requireVerifiedTeacher, upload } = require("../middleware");
 
 // ── Create course ──
 router.post(
   "/courses/create_course",
   verify,
   verifyTeacher,
+  requireVerifiedTeacher,
   upload.any(),
   teacherController.createCourse
 );

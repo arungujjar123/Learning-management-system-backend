@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const Admin = require("../models/Admin");
+const Teacher = require("../models/Teacher");
 const { JWT_SECRET, RESET_TOKEN_PURPOSE } = require("../config/jwt");
 const { getModelForRole } = require("../utils/userModels");
 
@@ -127,4 +128,32 @@ function verifyStudent(req, res, next) {
   }
 }
 
-module.exports = { verify, verifyAdmin, verifySuperAdmin, verifyTeacher, verifyStudent };
+// Middleware: only teachers whose qualification an admin approved may publish
+// courses. Runs BEFORE the upload middleware so a rejected request never
+// pushes files to Cloudinary.
+async function requireVerifiedTeacher(req, res, next) {
+  try {
+    const teacher = await Teacher.findById(req.user._id).select("verificationStatus");
+    if (!teacher || teacher.verificationStatus !== "Verified") {
+      return res.status(403).json({
+        message: "Your qualification must be verified by an admin before you can publish courses.",
+        verificationStatus: teacher?.verificationStatus || "NotSubmitted",
+        success: false,
+        error: true,
+      });
+    }
+    next();
+  } catch (error) {
+    console.error("Error in requireVerifiedTeacher middleware:", error.message);
+    return res.status(500).json({ message: "Server error", success: false, error: true });
+  }
+}
+
+module.exports = {
+  verify,
+  verifyAdmin,
+  verifySuperAdmin,
+  verifyTeacher,
+  verifyStudent,
+  requireVerifiedTeacher,
+};

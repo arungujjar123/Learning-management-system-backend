@@ -5,6 +5,7 @@ const {
   verifyTeacher,
   verifySuperAdmin,
   verifyStudent,
+  requireVerifiedTeacher,
 } = require("./verify");
 const { upload, cloudinary } = require("./upload");
 const { errorHandler, notFound } = require("./errorHandler");
@@ -16,6 +17,7 @@ module.exports = {
   verifySuperAdmin,
   verifyTeacher,
   verifyStudent,
+  requireVerifiedTeacher,
 
   // File upload
   upload,

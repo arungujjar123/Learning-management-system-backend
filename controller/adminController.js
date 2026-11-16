@@ -1,13 +1,14 @@
 const Student = require("../models/Student");
 const Teacher = require("../models/Teacher");
 const Course = require("../models/Course");
+const mongoose = require("mongoose");
 
 // 🟢 Dashboard Data
 const getDashboardData = async (req, res) => {
   try {
-    const studentCount = await Student.countDocuments({ isDeleted: false });
-    const teacherCount = await Teacher.countDocuments({ isDeleted: false });
-    const courseCount = await Course.countDocuments({ isDeleted: false });
+    const studentCount = await Student.countDocuments({ isDeleted: { $ne: true } });
+    const teacherCount = await Teacher.countDocuments({ isDeleted: { $ne: true } });
+    const courseCount = await Course.countDocuments({ isDeleted: { $ne: true } });
 
     res.status(200).json({
       success: true,
@@ -26,10 +27,10 @@ const getDashboardData = async (req, res) => {
 // 👥 Get All Users
 const getAllUsers = async (req, res) => {
   try {
-    const students = await Student.find({ isDeleted: false }).select(
+    const students = await Student.find({ isDeleted: { $ne: true } }).select(
       "-password",
     ); // hide passwords and exclude deleted
-    const teachers = await Teacher.find({ isDeleted: false }).select(
+    const teachers = await Teacher.find({ isDeleted: { $ne: true } }).select(
       "-password",
     );
 
@@ -50,7 +51,7 @@ const getAllUsers = async (req, res) => {
 // 📚 Get All Courses
 const getAllCourses = async (req, res) => {
   try {
-    const courses = await Course.find({ isDeleted: false }).populate(
+    const courses = await Course.find({ isDeleted: { $ne: true } }).populate(
       "teacher",
       "name email",
     );
@@ -115,7 +116,7 @@ const getCourseById = async (req, res) => {
     // Find all students who have enrolled in this course
     const enrolledStudents = await Student.find({
       "enrolledCourses.course": courseId,
-      isDeleted: false
+      isDeleted: { $ne: true }
     })
       .select("name email enrolledCourses")
       .lean();
@@ -190,7 +191,7 @@ const deleteTeacher = async (req, res) => {
     const { teacherId } = req.params;
 
     // Find teacher first to check if they have courses
-    const teacher = await Teacher.findById(teacherId).populate("courses");
+    const teacher = await Teacher.findById(teacherId);
 
     if (!teacher) {
       return res.status(404).json({
@@ -199,24 +200,30 @@ const deleteTeacher = async (req, res) => {
       });
     }
 
-    // Soft delete all courses created by this teacher
-    if (teacher.courses && teacher.courses.length > 0) {
-      await Course.updateMany(
-        { teacher: teacherId },
-        { isDeleted: true, deletedAt: new Date() },
+    // Teacher + their live courses are soft-deleted in ONE transaction with the
+    // SAME timestamp. Same timestamp marks "deleted by this cascade", so restore
+    // brings back exactly these courses, not ones an admin removed separately.
+    // Transaction: no half-deleted state if one of the writes fails.
+    const deletedAt = new Date();
+    let deletedCoursesCount = 0;
+    await mongoose.connection.transaction(async (session) => {
+      const result = await Course.updateMany(
+        { teacher: teacherId, isDeleted: { $ne: true } },
+        { isDeleted: true, deletedAt },
+        { session }
       );
-    }
+      deletedCoursesCount = result.modifiedCount;
 
-    // Soft delete the teacher
-    teacher.isDeleted = true;
-    teacher.deletedAt = new Date();
-    await teacher.save();
+      teacher.isDeleted = true;
+      teacher.deletedAt = deletedAt;
+      await teacher.save({ session });
+    });
 
     res.status(200).json({
       success: true,
       message: "Teacher and their courses deleted successfully",
       data: {
-        deletedCoursesCount: teacher.courses.length,
+        deletedCoursesCount,
       },
     });
   } catch (error) {

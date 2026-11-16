@@ -4,6 +4,7 @@ const Course = require("../models/Course");
 const Order = require("../models/Order");
 const Admin = require("../models/Admin");
 const bcrypt = require("bcryptjs");
+const mongoose = require("mongoose");
 const { buildBuckets } = require("../utils/analyticsBuckets");
 
 // Revenue split on every completed order. Teacher share is the remainder so
@@ -420,21 +421,39 @@ async function restoreUser(req, res) {
     const { userId } = req.params;
     const { userType } = req.body;
 
-    let Model = userType === "Teacher" ? Teacher : Student;
-    const user = await Model.findByIdAndUpdate(
-      userId,
-      { isDeleted: false, deletedAt: null },
-      { new: true }
-    );
-
+    const Model = userType === "Teacher" ? Teacher : Student;
+    const user = await Model.findById(userId);
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
+    if (!user.isDeleted) {
+      return res.status(400).json({ success: false, message: "User is not deleted" });
+    }
 
+    let restoredCoursesCount = 0;
+    await mongoose.connection.transaction(async (session) => {
+      // Cascade restore: only courses deleted together with this teacher
+      // (same deletedAt). Courses an admin deleted on their own stay deleted.
+      if (userType === "Teacher" && user.deletedAt) {
+        const result = await Course.updateMany(
+          { teacher: user._id, isDeleted: true, deletedAt: user.deletedAt },
+          { isDeleted: false, deletedAt: null },
+          { session }
+        );
+        restoredCoursesCount = result.modifiedCount;
+      }
+      user.isDeleted = false;
+      user.deletedAt = null;
+      await user.save({ session });
+    });
+
+    const data = user.toObject();
+    delete data.password;
     res.json({
       success: true,
       message: `${userType || "User"} restored successfully`,
-      data: user,
+      data,
+      restoredCoursesCount,
     });
   } catch (error) {
     console.error("Error in restoreUser:", error);
@@ -514,15 +533,23 @@ async function getDeletedCourses(req, res) {
 async function restoreCourse(req, res) {
   try {
     const { courseId } = req.params;
+    const existing = await Course.findById(courseId).populate("teacher", "isDeleted");
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Course not found" });
+    }
+    // Referential integrity: a course cannot come back while its teacher is deleted
+    if (existing.teacher && existing.teacher.isDeleted) {
+      return res.status(409).json({
+        success: false,
+        message: "Restore the teacher first; this course's teacher is deleted",
+      });
+    }
+
     const course = await Course.findByIdAndUpdate(
       courseId,
       { isDeleted: false, deletedAt: null },
       { new: true }
     );
-
-    if (!course) {
-      return res.status(404).json({ success: false, message: "Course not found" });
-    }
 
     res.json({
       success: true,

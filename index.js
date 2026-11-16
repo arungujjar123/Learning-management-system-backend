@@ -22,6 +22,7 @@ const superAdminRoutes = require("./routes/superAdminRoutes");
 app.use(morgan("dev"));
 
 // CORS configuration
+const VERCEL_PREVIEW_ORIGIN = /^https:\/\/learning-management-system-frontend[a-z0-9-]*\.vercel\.app$/;
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
@@ -35,7 +36,9 @@ app.use(
   cors({
     origin: function (origin, callback) {
       if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+      // Exact allowlist + this project's own Vercel preview URLs only.
+      // (A bare endsWith('.vercel.app') would trust every app hosted on Vercel.)
+      if (allowedOrigins.includes(origin) || VERCEL_PREVIEW_ORIGIN.test(origin)) {
         return callback(null, true);
       }
       return callback(new Error('Not allowed by CORS'));
