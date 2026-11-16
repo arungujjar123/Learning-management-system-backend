@@ -1,40 +1,47 @@
-const User = require('../models/Student'); // Adjust path to your User model
-const Course = require('../models/Course'); // Adjust path to your Course model
+const Student = require("../models/Student");
+const Teacher = require("../models/Teacher");
+const Course = require("../models/Course");
 
-exports.getPublicStats = async (req, res) => {
+const notDeleted = { isDeleted: { $ne: true } };
+
+/**
+ * Platform counts shown on the public home page. Students and teachers live in
+ * separate collections, so they are counted per model rather than by a role
+ * string. Soft-deleted users and courses are not counted.
+ */
+async function computePlatformStats() {
+  const [students, instructors, courses, materials, videoData] = await Promise.all([
+    Student.countDocuments(notDeleted),
+    Teacher.countDocuments(notDeleted),
+    Course.countDocuments(notDeleted),
+    Course.countDocuments({ ...notDeleted, notes: { $exists: true, $ne: "" } }),
+    // Each topic in each chapter has one video
+    Course.aggregate([
+      { $match: notDeleted },
+      { $unwind: "$chapters" },
+      { $project: { topics: { $size: { $ifNull: ["$chapters.topics", []] } } } },
+      { $group: { _id: null, total: { $sum: "$topics" } } },
+    ]),
+  ]);
+
+  return {
+    students,
+    instructors,
+    videos: videoData[0]?.total || 0,
+    materials,
+    courses,
+  };
+}
+
+// GET /courses/stats/public
+async function getPublicStats(req, res) {
   try {
-    // 1. Count Students (users with role 'student')
-    const students = await User.countDocuments({ role: 'student' });
-
-    // 2. Count Instructors (users with role 'instructor' or 'teacher')
-    const instructors = await User.countDocuments({ role: 'instructor' });
-
-    // 3. Count Materials (Total number of courses)
-    const materials = await Course.countDocuments({});
-
-    // 4. Count Videos (Sum of 'lessons' or 'videos' field in all courses)
-    // We use MongoDB aggregation to sum up a field across all documents
-    const videoData = await Course.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalVideos: { $sum: "$lessons" } // Change "$lessons" to whatever your field name is (e.g. "$videoCount")
-        }
-      }
-    ]);
-    const videos = videoData.length > 0 ? videoData[0].totalVideos : 0;
-
-    res.status(200).json({
-      success: true,
-      stats: {
-        students,
-        instructors,
-        videos,
-        materials
-      }
-    });
+    const stats = await computePlatformStats();
+    res.status(200).json({ success: true, stats });
   } catch (error) {
     console.error("Error fetching stats:", error);
     res.status(500).json({ success: false, message: "Server Error" });
   }
-};
+}
+
+module.exports = { computePlatformStats, getPublicStats };
